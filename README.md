@@ -34,7 +34,7 @@ Grab the archive for your system from the **Releases** page, unpack it and run `
 | macOS (Apple Silicon) | `TokSaver-macos-arm64.zip` | Unsigned: right-click → *Open*, or `xattr -dr com.apple.quarantine TokSaver`. |
 | Linux x86-64 | `TokSaver-linux-x86_64.zip` | `chmod +x TokSaver` if needed. Requires a desktop session (X11/Wayland). |
 
-Your data (`data/`, `bin/`, `logs/`) is created next to the program, so the folder is portable.
+r data (`data/`, `bin/`, `logs/`) is created next to the program, so the folder is portable.
 On first start the app downloads and verifies `yt-dlp` itself.
 
 ## Run from source
@@ -42,7 +42,7 @@ On first start the app downloads and verifies `yt-dlp` itself.
 Requires Python 3.10+ with tkinter.
 
 ```bash
-git clone https://github.com/<you>/TokSaver.git
+git clone https://github.com/HoneyAnal/TokSaver.git
 cd TokSaver
 python main.py          # Windows: double-click "Запустить.bat"
 ```
