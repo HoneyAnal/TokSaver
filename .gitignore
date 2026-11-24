@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+logs/
+run.log
+crash.log
+data/
+Downloads/
+bin/yt-dlp*
+bin/ciadpi.exe
+*.sha256
+.pytest_cache/
+dist/
+build/
+*.spec
