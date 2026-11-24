@@ -1,0 +1,21 @@
+name: Tests
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: sudo apt-get update && sudo apt-get install -y xvfb python3-tk
+      - run: pip install -r requirements.txt pytest
+      - run: xvfb-run -a python -m pytest -q tests
+        env:
+          TOKSAVER_SKIP_DEPS: "1"
