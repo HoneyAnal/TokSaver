@@ -9,6 +9,11 @@ import platform
 import shutil
 import sys
 
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")   # консоль Windows (cp1252)
+except Exception:
+    pass
+
 import PyInstaller.__main__
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -36,7 +41,7 @@ def main():
         if os.path.exists(f):
             shutil.copy(f, os.path.join("dist", "TokSaver", f))
     shutil.make_archive(os.path.join("dist", name), "zip", "dist", "TokSaver")
-    print("Готово:", os.path.join("dist", name + ".zip"))
+    print("Done:", os.path.join("dist", name + ".zip"))
 
 
 if __name__ == "__main__":
