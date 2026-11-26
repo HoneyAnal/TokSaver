@@ -8,6 +8,8 @@ English · [Русский](README.ru.md)
 > **Disclaimer.** TokSaver is an independent project, not affiliated with or endorsed by TikTok.
 > Use it only for content you have the right to save, and respect TikTok's terms and local law.
 
+![TokSaver main window](docs/screenshot.png)
+
 ## Features
 
 - **Accounts with a database** — every account has its own folder and SQLite DB; videos *and* photo carousels, resumable queue, "outside range" tracking.
