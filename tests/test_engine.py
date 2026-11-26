@@ -194,3 +194,102 @@ def test_sync_summary_counts_files_and_failures(tmp_app):
     assert any("2.0 KB" in m for m in logs)
     assert toasts and toasts[0][0] == "warn"          # есть ошибка → предупреждение
     assert e._sync_run is None
+
+
+def test_failure_streak_stops_queue(eng, monkeypatch):
+    """8 неудач подряд без единого успеха — очередь останавливается, остаток не трогаем."""
+    import db
+    acc_id, _ = db.db_add_account("alice", None)
+    acc = db.db_get_account(acc_id)
+    calls = []
+    monkeypatch.setattr(eng, "download_one",
+                        lambda a, vid, ff: (calls.append(vid) or (False, None, "video")))
+    pending = [str(7000000000000000000 + i) for i in range(30)]
+    eng._download_pending_seq(acc, pending)
+    assert len(calls) == engine.FAIL_STREAK_LIMIT
+    assert any("failures in a row" in m or "неудач подряд" in m for m in logs(eng))
+
+
+def test_gallerydl_retries_without_proxy(eng, monkeypatch, tmp_path):
+    """403 через прокси → повтор напрямую; удачный прямой путь запоминается."""
+    eng.gdl_cmd = ["gdl"]
+    monkeypatch.setattr(eng, "_proxy_alive", lambda: True)
+    seen = []
+
+    def once(url, dest, use_proxy):
+        seen.append(use_proxy)
+        return (not use_proxy), ("x.jpg" if not use_proxy else None)
+    monkeypatch.setattr(eng, "_gallerydl_once", once)
+    assert eng._gallerydl_download("https://www.tiktok.com/@a/video/1", str(tmp_path)) == (True, "x.jpg")
+    assert seen == [True, False]
+    seen.clear()
+    eng._gallerydl_download("https://www.tiktok.com/@a/video/2", str(tmp_path))
+    assert seen == [False]
+
+
+def test_gallerydl_several_rounds(eng, monkeypatch, tmp_path):
+    """403 приходит волнами: gallery-dl пробуем несколько раз и берём первый успех."""
+    eng.gdl_cmd = ["gdl"]
+    monkeypatch.setattr(eng, "_proxy_alive", lambda: False)
+    monkeypatch.setattr(engine.time, "sleep", lambda s: None)
+    n = []
+
+    def once(url, dest, use_proxy):
+        n.append(1)
+        return (len(n) == 3), ("a.jpg" if len(n) == 3 else None)
+    monkeypatch.setattr(eng, "_gallerydl_once", once)
+    assert eng._gallerydl_download("https://www.tiktok.com/@a/video/1", str(tmp_path)) == (True, "a.jpg")
+    assert len(n) == 3
+    n.clear()
+    monkeypatch.setattr(eng, "_gallerydl_once", lambda *a: (n.append(1), (False, None))[1])
+    assert eng._gallerydl_download("https://www.tiktok.com/@a/video/1", str(tmp_path)) == (False, None)
+    assert len(n) == eng.GDL_ROUNDS
+
+
+def test_secuid_via_gallerydl(eng, monkeypatch):
+    import subprocess
+    sec = "MS4wLjABAAAA" + "y" * 60
+    eng.gdl_cmd = ["gdl"]
+    monkeypatch.setattr(eng, "_proxy_alive", lambda: False)
+    monkeypatch.setattr(engine.time, "sleep", lambda s: None)
+    out = json.dumps([[3, {"user": {"secUid": sec}}]])
+    monkeypatch.setattr(eng, "_run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, out, ""))
+    assert eng._secuid_via_gallerydl("alice") == sec
+    monkeypatch.setattr(eng, "_run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, "", "403"))
+    assert eng._secuid_via_gallerydl("alice") is None
+    assert eng._secuid_via_gallerydl("плохой ник!") is None
+
+
+def test_ytdlp_gets_private_cookie_copy(eng, tmp_path, monkeypatch):
+    """yt-dlp получает рабочую копию cookies, а исходный файл остаётся нетронутым."""
+    src = tmp_path / "cookies.txt"
+    src.write_text("# Netscape HTTP Cookie File\n")
+    monkeypatch.setattr(engine.paths, "DATA_DIR", str(tmp_path / "d"))
+    assert eng.set_cookies_file(str(src))
+    args = eng._base_args()
+    used = args[args.index("--cookies") + 1]
+    assert used != str(src) and os.path.exists(used)
+    with open(used, "a") as f:                    # «yt-dlp дописал своё»
+        f.write("junk\n")
+    assert src.read_text() == "# Netscape HTTP Cookie File\n"
+
+
+def test_ytdlp_second_attempt_without_proxy(eng, monkeypatch, tmp_path):
+    """Первая попытка через прокси не удалась — вторая идёт напрямую и запоминается."""
+    media = tmp_path / "m"
+    media.mkdir()
+    monkeypatch.setattr(engine.db, "account_media_dir", lambda _a: str(media))
+    monkeypatch.setattr(eng, "_proxy_alive", lambda: True)
+    monkeypatch.setattr(eng, "_wait_throttle", lambda: None)
+    monkeypatch.setattr(engine.time, "sleep", lambda s: None)
+    calls = []
+    good = media / "20260101_1.mp4"
+    good.write_bytes(b"x" * 100)
+
+    def fake(cmd):
+        calls.append("--proxy" in cmd)
+        return (1, None) if len(calls) == 1 else (0, str(good))
+    monkeypatch.setattr(eng, "_run_ytdlp_download", fake)
+    monkeypatch.setattr(eng, "_existing_media", lambda *a: None)
+    ok, path, kind = eng._download_one_impl({"id": 1, "nickname": "a"}, "1", False)
+    assert ok and calls == [True, False] and eng._ytdlp_direct_first
