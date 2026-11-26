@@ -68,6 +68,7 @@ def byedpi_args(port):
 GDL_SPEC = "gallery-dl>=1.32.20,<2"
 PYSOCKS_SPEC = "pysocks==1.7.1"
 
+FAIL_STREAK_LIMIT = 8      # столько неудач подряд — похоже на лимит TikTok: очередь останавливаем
 SEC_UID_RE = re.compile(r"MS4wLjABAAAA[A-Za-z0-9_-]{56,80}")  # постоянный ID профиля
 # ID в JSON-данных страницы (ключ secUid) — надёжнее простого поиска по тексту
 SEC_JSON_RE = re.compile(r'"secUid"\s*:\s*"(MS4wLjABAAAA[A-Za-z0-9_-]{56,80})"')
@@ -176,6 +177,7 @@ class Engine:
         self.proxy_port = settings.get_port(self.settings)
         self.ytdlp_version = settings.get_ytdlp_version(self.settings)
         self.use_byedpi = True
+        self.sort_by_type = True        # новые файлы — в подпапки Video/ и Photos/
         self.cookies = ""               # 'chrome' / 'firefox' / 'edge'…
         self.cookies_file = None        # путь к экспортированному cookies.txt
         self.byedpi_process = None
@@ -183,6 +185,7 @@ class Engine:
         self.deps_ready = False
         self._sync_run = None                # статистика текущей массовой синхронизации
         self._stop_all = False          # «Остановить всех» нажата
+        self._cookie_copy_lock = threading.Lock()
         self._cancel_req = set()        # acc_id с нажатой «Стоп» (отмена очереди)
         self._state_lock = threading.RLock()   # счётчики задач, процессы, backoff
         self._tasks_active = 0          # сколько задач сейчас работает (для события «занято»)
@@ -315,6 +318,30 @@ class Engine:
 
     # --- cookies.txt ---
     MAX_COOKIES_FILE = 5 * 1024 * 1024
+
+    def _ytdlp_cookies_copy(self):
+        """yt-dlp после КАЖДОГО запуска перезаписывает файл cookies (добавляет свои
+        временные значения). Чтобы он не портил ваш файл — и не подсовывал gallery-dl
+        «изменённые» cookies, — yt-dlp получает собственную рабочую копию в data/.
+        Копия обновляется, когда меняется исходный файл. None — не вышло (берём оригинал)."""
+        src = self.cookies_file
+        if not src:
+            return None
+        try:
+            st = os.stat(src)
+            key = (os.path.abspath(src), st.st_mtime_ns, st.st_size)
+            dst = os.path.join(paths.DATA_DIR, ".cookies.ytdlp.txt")
+            with self._cookie_copy_lock:
+                if getattr(self, "_cookie_copy_key", None) != key or not os.path.exists(dst):
+                    os.makedirs(paths.DATA_DIR, exist_ok=True)
+                    shutil.copyfile(src, dst)
+                    if not paths.IS_WIN:
+                        os.chmod(dst, 0o600)
+                    self._cookie_copy_key = key
+            return dst
+        except OSError as _exc:
+            _LOG.debug("cookies copy: %r", _exc)
+            return None
 
     def set_cookies_file(self, path):
         """Подключает файл cookies.txt (None — отключить). Проверяет, что это
@@ -641,13 +668,13 @@ class Engine:
             self.log_exc(tr('Something broke while checking components:'))
 
     # ------------------------------ yt-dlp ------------------------------
-    def _base_args(self):
+    def _base_args(self, use_proxy=True):
         args = []
-        if self._proxy_alive():
+        if use_proxy and self._proxy_alive():
             args += ["--proxy", self.proxy_url]
         # Авторизация (закрытые аккаунты): файл cookies.txt приоритетнее браузера
         if self.cookies_file:
-            args += ["--cookies", self.cookies_file]
+            args += ["--cookies", self._ytdlp_cookies_copy() or self.cookies_file]
         elif self.cookies:
             args += ["--cookies-from-browser", self.cookies]
         args += ["--socket-timeout", "20", "--retries", "3", "--no-warnings"]
@@ -655,18 +682,27 @@ class Engine:
 
     def _channel_id_of_video(self, video_url):
         """Постоянный ID профиля (sec_uid) автора любого поста:
-        сначала yt-dlp, если тот поймал site-bug TikTok — embed-страница поста."""
-        cmd = [YT_DLP_EXE, validate.safe_arg(video_url), "--print", "channel_id"] + self._base_args()
-        try:
-            r = self._run(cmd, text=True, encoding="utf-8",
-                               errors="ignore", timeout=120, creationflags=paths.CREATE_NO_WINDOW)
-        except Exception as _exc:
-            _LOG.debug('suppressed error: %r', _exc, exc_info=True)
-            r = None
-        for line in ((r.stdout or "").splitlines() if r else []):
-            line = line.strip()
-            if SEC_UID_RE.fullmatch(line):
-                return line
+        сначала yt-dlp (с прокси, если он работает, и без него — как при ручном
+        запуске), если не вышло — embed-страница поста. Причина сбоя пишется в журнал."""
+        attempts = [True, False] if self._proxy_alive() else [False]
+        for use_proxy in attempts:
+            cmd = [YT_DLP_EXE, validate.safe_arg(video_url), "--print", "channel_id"] \
+                  + self._base_args(use_proxy=use_proxy)
+            try:
+                r = self._run(cmd, text=True, encoding="utf-8", errors="ignore",
+                              timeout=180, creationflags=paths.CREATE_NO_WINDOW)
+            except Exception as _exc:
+                _LOG.debug('suppressed error: %r', _exc, exc_info=True)
+                self.log(tr('yt-dlp could not read the post: {0}', _exc), LEVEL_DIM)
+                continue
+            for line in (r.stdout or "").splitlines():
+                line = line.strip()
+                if SEC_UID_RE.fullmatch(line):
+                    return line
+            err = [ln.strip() for ln in (r.stderr or "").splitlines() if ln.strip()]
+            if err:
+                self.log(tr('yt-dlp could not read the post: {0}',
+                            err[-1][:300]), LEVEL_DIM)
         return self._secuid_via_embed(video_url)
 
     def _http_get(self, url, timeout, proxy=None):
@@ -1032,6 +1068,8 @@ class Engine:
         sec, _up = self._profile_meta(nickname)
         if not sec:
             sec = self._resolve_sec_uid(nickname)
+        if not sec:
+            sec = self._secuid_via_gallerydl(nickname)
         if sec:
             if acc_id is not None:
                 db.db_update_sec_uid(acc_id, sec)
@@ -1042,6 +1080,48 @@ class Engine:
             self.log(tr('Could not get the permanent ID of “{0}”. Check the nickname — the account may not exist or be unavailable. If you have a link to any POST of this account, add that instead: the ID is resolved more reliably from a post.', nickname),
                      LEVEL_WARN)
         return sec
+
+    def _secuid_via_gallerydl(self, nickname):
+        """Запасной путь по одному нику (в том числе закрытые аккаунты с cookies):
+        gallery-dl сам решает защитную страницу TikTok и читает профиль. Адрес профиля он
+        лишь раскрывает в /avatar и /posts, поэтому обращаемся к ним напрямую и берём
+        первый пост (--range 1) в виде JSON — в нём есть secUid автора."""
+        if not self.gdl_cmd or not validate.NICK_RE.match(nickname or ""):
+            return None
+        urls = [f"https://www.tiktok.com/@{nickname}/posts",
+                f"https://www.tiktok.com/@{nickname}/avatar"]
+        modes = [True, False] if self._proxy_alive() else [False]
+        why = None
+        for rnd in range(3):
+            for use_proxy in modes:
+                for url in urls:
+                    cmd = self.gdl_cmd + ["--range", "1", "-j"]
+                    if use_proxy:
+                        cmd += ["--proxy", self.proxy_url]
+                    if self.cookies_file:
+                        cmd += ["--cookies", self.cookies_file]
+                    elif self.cookies:
+                        cmd += ["--cookies-from-browser", self.cookies]
+                    cmd.append(validate.safe_arg(url))
+                    try:
+                        r = self._run(cmd, text=True, encoding="utf-8", errors="ignore",
+                                      timeout=150, creationflags=paths.CREATE_NO_WINDOW)
+                    except Exception as _exc:
+                        _LOG.debug('gallery-dl secuid: %r', _exc, exc_info=True)
+                        continue
+                    m = SEC_UID_RE.search(r.stdout or "")
+                    if m:
+                        return m.group(0)
+                    err = [ln.strip() for ln in (r.stderr or "").splitlines() if ln.strip()]
+                    out = [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip()]
+                    why = (err[-1] if err else (out[-1] if out else
+                           tr('empty output, exit code {0}', r.returncode)))
+            if self._is_cancelled_any():
+                break
+            time.sleep(2)
+        if why:
+            self.log(tr('gallery-dl could not read the profile: {0}', why[:300]), LEVEL_DIM)
+        return None
 
     def _enumerate_videos(self, url, limit, acc_id=None):
         """Список постов профиля (yt-dlp, flat-playlist).
@@ -1112,13 +1192,76 @@ class Engine:
         return rows, current_handle, err
 
     def _gallerydl_download(self, url, dest_dir):
-        """Скачивает пост (фото-карусель) через gallery-dl. Возвращает (успех, путь первого файла)."""
+        """Скачивает пост (фото-карусель) через gallery-dl. Возвращает (успех, путь первого файла).
+        TikTok нередко отвечает 403 на запросы через прокси ByeDPI, поэтому при неудаче
+        повторяем напрямую; если прямой путь сработал — дальше пробуем его первым."""
         if not self.gdl_cmd:
             return False, None
         os.makedirs(dest_dir, exist_ok=True)
+        modes = [False] if not self._proxy_alive() else (
+            [False, True] if getattr(self, "_gdl_prefer_direct", False) else [True, False])
+        # gallery-dl сам при 403 ничего не повторяет, а заголовки у него в каждом процессе
+        # случайные: часть запусков TikTok пропускает, часть нет — поэтому несколько попыток
+        for rnd in range(self.GDL_ROUNDS):
+            for use_proxy in modes:
+                ok, first = self._gallerydl_once(url, dest_dir, use_proxy)
+                vid = url.rstrip("/").rpartition("/")[2].split("?")[0]
+                if ok:
+                    bad = postmedia.bad_photo_files(dest_dir, vid) if vid.isdigit() else []
+                    if bad:
+                        # битая/пустая картинка (обрыв, заглушка вместо файла) — не успех
+                        for f in bad:
+                            self.log(tr('    Broken picture removed: {0}', os.path.basename(f)[:80]), LEVEL_WARN)
+                            try:
+                                os.remove(f)
+                            except OSError as _exc:
+                                _LOG.debug('remove bad picture: %r', _exc)
+                        ok = False
+                if ok and vid.isdigit():
+                    # все ли картинки на месте: TikTok сообщает число в «count» (json рядом)
+                    root = os.path.dirname(dest_dir) if os.path.basename(dest_dir) in postmedia.SORT_DIRS else dest_dir
+                    want = postmedia.expected_count(vid, dest_dir, os.path.join(root, postmedia.SUB_INFO))
+                    have = len(postmedia.photo_files(dest_dir, vid))
+                    if want and have < want:
+                        self.log(tr('    Only {0} of {1} pictures downloaded — retrying the missing ones.', have, want), LEVEL_WARN)
+                        ok = False
+                if ok:
+                    if modes[0] is True and not use_proxy:
+                        self._gdl_prefer_direct = True
+                    if self.sort_by_type:
+                        _vid = url.rstrip("/").rpartition("/")[2].split("?")[0]
+                        _root = os.path.dirname(dest_dir) if os.path.basename(dest_dir) in postmedia.SORT_DIRS else dest_dir
+                        postmedia.move_meta(dest_dir, _vid, os.path.join(_root, postmedia.SUB_INFO))
+                    try:
+                        vid = url.rstrip("/").rpartition("/")[2].split("?")[0]
+                        ren = postmedia.fix_extensions(dest_dir, vid) if vid.isdigit() else {}
+                        if ren:
+                            self.log(tr('    Picture extensions corrected to the real format: {0}', len(ren)), LEVEL_DIM)
+                            if first:
+                                for old_p, new_p in ren.items():
+                                    if os.path.normcase(old_p) == os.path.normcase(first):
+                                        first = new_p
+                    except Exception as _exc:
+                        _LOG.debug('fix extensions: %r', _exc, exc_info=True)
+                    return ok, first
+                if self._is_cancelled_any():
+                    return False, None
+            if rnd < self.GDL_ROUNDS - 1:
+                if rnd == 0:
+                    self.log(tr('    TikTok refused — waiting a few seconds and trying once more…'), LEVEL_DIM)
+                time.sleep(3)
+                self._wait_throttle()
+        return False, None
+
+    GDL_ROUNDS = 4
+
+    def _is_cancelled_any(self):
+        return bool(getattr(self, "_stop_all", False))
+
+    def _gallerydl_once(self, url, dest_dir, use_proxy):
         # -D: файлы кладутся прямо в папку аккаунта, без лишних подпапок
         cmd = self.gdl_cmd + ["-D", dest_dir]
-        if self._proxy_alive():
+        if use_proxy:
             cmd += ["--proxy", self.proxy_url]
         if self.cookies_file:
             cmd += ["--cookies", self.cookies_file]
@@ -1129,6 +1272,7 @@ class Engine:
         cmd.append(validate.safe_arg(url))
         first_path = None
         try:
+            self.log("    gallery-dl: " + " ".join(cmd[len(self.gdl_cmd):]), LEVEL_DIM)
             p = self._popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                  text=True, encoding="utf-8", errors="ignore", bufsize=1,
                                  creationflags=paths.CREATE_NO_WINDOW)
@@ -1144,6 +1288,8 @@ class Engine:
                         first_path = line
                     if "ERROR" in line.upper() or first_path == line:
                         self.log("    [gallery-dl] " + line[:300])
+                    elif "WARNING" in line.upper():
+                        self.log("    [gallery-dl] " + line[:300], LEVEL_DIM)
             return p.poll() == 0, first_path
         except Exception as e:
             self.log(tr('    [gallery-dl] failure: {0}', e), LEVEL_WARN)
@@ -1154,10 +1300,7 @@ class Engine:
         «…ID.description» (пишет yt-dlp с --write-description) или
         «…ID.json» (пишет gallery-dl с --write-metadata — фото-посты).
         Текст описания или None. Описание обрезается до 6000 знаков."""
-        try:
-            names = os.listdir(media_dir)
-        except OSError:
-            return None
+        names = postmedia.list_names(media_dir)
         for name in names:
             low = name.lower()
             if video_id not in name:
@@ -1205,13 +1348,18 @@ class Engine:
         except OSError:
             return False
 
+    def _sort_into(self, media_dir, video_id, sub, *paths_):
+        """Переносит файлы поста в подпапку; возвращает пути с учётом переноса."""
+        moved = postmedia.relocate(media_dir, video_id, sub)
+        out = []
+        for p in paths_:
+            out.append(next((n for o, n in moved.items()
+                             if p and os.path.normcase(o) == os.path.normcase(p)), p))
+        return out
+
     def _existing_media(self, media_dir, video_id):
         """Готовый видеофайл поста в media/ (имя содержит ID, не .part): путь или None."""
-        try:
-            names = os.listdir(media_dir)
-        except OSError:
-            return None
-        for name in names:
+        for name in postmedia.list_names(media_dir):
             if video_id in name and name.lower().endswith(self.VIDEO_EXTS):
                 path = os.path.join(media_dir, name)
                 if self._file_ok(path):
@@ -1239,7 +1387,8 @@ class Engine:
                 if "ERROR" in line:
                     self.log("    " + line[:300], LEVEL_ERROR)
                     low = line.lower()
-                    if "429" in low or "too many requests" in low or "rate limit" in low:
+                    if ("429" in low or "too many requests" in low or "rate limit" in low
+                            or "no video formats found" in low):
                         self._note_rate_limit()
         return p.poll(), file_path
 
@@ -1248,14 +1397,29 @@ class Engine:
         nickname = acc["nickname"]
         self._wait_throttle()
         media_dir = db.account_media_dir(acc["id"]) or paths.OUTPUT_DIR
-        output_template = os.path.join(media_dir, "%(upload_date)s_%(id)s.%(ext)s")
+        output_template = os.path.join(media_dir, postmedia.SUB_VIDEO if self.sort_by_type else "",
+                                       "%(upload_date)s_%(id)s.%(ext)s")
         url = f"https://www.tiktok.com/@{nickname}/video/{video_id}"
         fmt = ["-f", "bv*+ba/b", "--merge-output-format", "mp4"] if has_ffmpeg else ["-f", "b"]
+        if self.sort_by_type:
+            # описание и обложка — в Info/, чтобы не мешали видео
+            info_t = os.path.join(media_dir, postmedia.SUB_INFO, "%(upload_date)s_%(id)s.%(ext)s")
+            fmt = fmt + ["-o", "description:" + info_t, "-o", "thumbnail:" + info_t]
         # --write-description: рядом с видео лежит текстовый файл с описанием;
         # --write-thumbnail: обложка поста — превью для окна «Посты аккаунта»
-        cmd = [YT_DLP_EXE, validate.safe_arg(url), "-o", output_template] + fmt + self._base_args() \
-            + ["--newline", "--write-description", "--write-thumbnail",
-               "--continue", "--fragment-retries", "5"]
+        def build(use_proxy):
+            return [YT_DLP_EXE, validate.safe_arg(url), "-o", output_template] + fmt \
+                + self._base_args(use_proxy=use_proxy) \
+                + ["--newline", "--write-description", "--write-thumbnail",
+                   "--continue", "--fragment-retries", "5"]
+        # Через прокси ByeDPI TikTok местами отвечает 403 — вторая попытка идёт напрямую
+        # (и, если прямой путь выручил, дальше пробуем его первым).
+        if not self._proxy_alive():
+            modes = [False, False]
+        elif getattr(self, "_ytdlp_direct_first", False):
+            modes = [False, True]
+        else:
+            modes = [True, False]
         # Уже скачанный файл на диске (например, потерялась запись в базе): сеть не нужна
         existing = self._existing_media(media_dir, video_id)
         if existing:
@@ -1266,13 +1430,15 @@ class Engine:
         # Две попытки: после сбоя сети yt-dlp ДОКАЧИВАЕТ оборванный .part, а не начинает заново
         for attempt in (1, 2):
             try:
-                code, found = self._run_ytdlp_download(cmd)
+                code, found = self._run_ytdlp_download(build(modes[attempt - 1]))
             except Exception as e:
                 _LOG.exception(tr('yt-dlp crash'))
                 self.log(tr('    Crash: {0}', e), LEVEL_ERROR)
                 return False, None, "video"
             file_path = found or file_path
             if code == 0:
+                if attempt == 2 and modes[0] is True and modes[1] is False:
+                    self._ytdlp_direct_first = True
                 break
             if attempt == 1:
                 self.log(tr('    Download failed — retrying (an interrupted file will resume).'), LEVEL_WARN)
@@ -1293,7 +1459,10 @@ class Engine:
         ext = os.path.splitext(file_path or "")[1].lower()
         if ok and ext in AUDIO_MEDIA_EXTS:
             self.log(tr('    This is a photo post: yt-dlp downloaded only the music. Downloading the pictures (gallery-dl)…'), LEVEL_WARN)
-            gok, gpath = self._gallerydl_download(url, media_dir)
+            gdir = os.path.join(media_dir, postmedia.SUB_PHOTOS) if self.sort_by_type else media_dir
+            if self.sort_by_type:
+                file_path = self._sort_into(media_dir, video_id, postmedia.SUB_PHOTOS, file_path)[0]
+            gok, gpath = self._gallerydl_download(url, gdir)
             if gok:
                 return True, (gpath or file_path), "photo"
             self.log(tr('    Pictures were not downloaded (music saved). Check the gallery-dl installation.'), LEVEL_WARN)
@@ -1302,7 +1471,12 @@ class Engine:
             self.log(tr('    yt-dlp failed — trying gallery-dl…'), LEVEL_WARN)
             gok, gpath = self._gallerydl_download(url, media_dir)
             if gok:
-                return True, gpath, "photo"
+                is_vid = bool(gpath) and gpath.lower().endswith(postmedia.VIDEO_EXTS)
+                if self.sort_by_type:
+                    gpath = self._sort_into(media_dir, video_id,
+                                            postmedia.SUB_VIDEO if is_vid else postmedia.SUB_PHOTOS,
+                                            gpath)[0]
+                return True, gpath, ("video" if is_vid else "photo")
         return ok, file_path, "video"
 
     # =============================== ЗАДАЧИ ===============================
@@ -1662,10 +1836,7 @@ class Engine:
         media = db.account_media_dir(acc_id)
         if not media:
             return 0, 0, 0
-        try:
-            names = os.listdir(media)
-        except OSError:
-            return 0, 0, 0
+        names = postmedia.list_names(media)
         # сайдкары и обложки — НЕ медиа: иначе «чинили» бы путь к превью
         # вместо самого видео (cover.jpg кэша oembed, webp от yt-dlp)
         skip_exts = (".description", ".json", ".part", ".webp", ".cover.jpg")
@@ -1679,7 +1850,8 @@ class Engine:
                 continue
             found = None
             for name in names:
-                if p["video_id"] in name and not name.lower().endswith(skip_exts):
+                if (p["video_id"] in name and not name.startswith(postmedia.SUB_INFO + "/")
+                        and not name.lower().endswith(skip_exts)):
                     cand = os.path.join(media, name)
                     if os.path.isfile(cand):
                         found = cand
@@ -1888,7 +2060,7 @@ class Engine:
         has_ffmpeg = bool(shutil.which("ffmpeg"))
         total = len(pending)
         self.log(tr('“{0}”: {1} posts to download, workers: {2}.', nickname, total, workers), LEVEL_DL)
-        ok_count = fail_count = finished = 0
+        ok_count = fail_count = finished = streak = 0
         todo = iter(pending)
         in_flight = {}
         stop = None                                    # None | "cancel" | "pause"
@@ -1930,9 +2102,14 @@ class Engine:
                         db.db_mark_downloaded(acc_id, vid, path, kind)
                         self._run_note_file(nickname, acc_id, vid, path, kind)
                         ok_count += 1
+                        streak = 0
                     else:
                         self._run_note_fail(nickname)
                         fail_count += 1
+                        streak += 1
+                        if (streak >= FAIL_STREAK_LIMIT and ok_count == 0
+                                or streak >= FAIL_STREAK_LIMIT * 2) and not stop:
+                            stop = "limit"
                     self.log(tr('Post {0}/{1}: id {2} — {3}', finished, total, vid, tr('done') if ok else tr('failure')),
                              LEVEL_INFO if ok else LEVEL_WARN)
                     self.emit("card", (acc_id, tr('Downloading {0}/{1}…', finished, total)))
@@ -1940,6 +2117,9 @@ class Engine:
                     submit_next()
 
         rest = list(todo)
+        if stop == "limit":
+            self._streak_stop(nickname, streak, len(rest))
+            return self._pending_summary(acc, ok_count, fail_count, total)
         if stop == "cancel":
             db.db_skip_videos(acc_id, rest)
             self.log(tr('“{0}”: CANCELLED — stopped after {1} posts, {2} removed from the queue (restore: right-click → “Download skipped”).', nickname, ok_count, len(rest)), LEVEL_WARN)
@@ -1965,7 +2145,7 @@ class Engine:
         acc_id, nickname = acc["id"], acc["nickname"]
         has_ffmpeg = bool(shutil.which("ffmpeg"))
         self.log(tr('“{0}”: {1} posts to download.', nickname, len(pending)), LEVEL_DL)
-        ok_count, fail_count = 0, 0
+        ok_count, fail_count, streak = 0, 0, 0
         for i, vid in enumerate(pending, 1):
             if self._is_cancelled(acc_id):
                 rest = pending[i - 1:]
@@ -1994,10 +2174,21 @@ class Engine:
                 db.db_mark_downloaded(acc_id, vid, path, kind)
                 self._run_note_file(nickname, acc_id, vid, path, kind)
                 ok_count += 1
+                streak = 0
             else:
                 self._run_note_fail(nickname)
                 fail_count += 1
+                streak += 1
+                if streak >= FAIL_STREAK_LIMIT and ok_count == 0 or streak >= FAIL_STREAK_LIMIT * 2:
+                    self._streak_stop(nickname, streak, len(pending) - i)
+                    break
         return self._pending_summary(acc, ok_count, fail_count, len(pending))
+
+    def _streak_stop(self, nickname, streak, left):
+        """Серия неудач подряд: почти всегда это лимит запросов TikTok.
+        Оставшиеся посты НЕ помечаются — они доедут при следующей синхронизации."""
+        self.log(tr('“{0}”: {1} failures in a row — TikTok is most likely limiting requests. Stopped; {2} posts stay in the queue. Sync again in 30+ minutes.',
+                    nickname, streak, left), LEVEL_WARN)
 
     def _pending_summary(self, acc, ok_count, fail_count, n_total):
         """Общий итог очереди (последовательной и параллельной). True, если что-то скачано."""
@@ -2058,10 +2249,7 @@ class Engine:
         media = db.account_media_dir(acc_id)
         if not media:
             return {}
-        try:
-            names = os.listdir(media)
-        except OSError:
-            return {}
+        names = postmedia.list_names(media)
         best = {}
         for name in names:
             low = name.lower()
@@ -2092,7 +2280,8 @@ class Engine:
             for vid in video_ids:
                 if acc_id in self._cancel_req:
                     break
-                dest = os.path.join(media, f"{vid}.cover.jpg")
+                dest = os.path.join(media, postmedia.SUB_INFO if self.sort_by_type else "", f"{vid}.cover.jpg")
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
                 if os.path.exists(dest):
                     self.emit("vcov", (acc_id, vid, dest))
                     continue

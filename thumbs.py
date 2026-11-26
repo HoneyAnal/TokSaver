@@ -13,6 +13,7 @@
 """
 import itertools
 import os
+import postmedia
 import queue
 import shutil
 import subprocess
@@ -40,10 +41,7 @@ def find_source(media_dir, video_id, names=None):
     """Источник превью поста в media/: ("image"|"video", путь) или None.
     names — заранее прочитанный os.listdir (чтобы не читать папку на каждый пост)."""
     if names is None:
-        try:
-            names = os.listdir(media_dir)
-        except OSError:
-            return None
+        names = postmedia.list_names(media_dir)
     image = video = None
     for name in names:
         if video_id not in name:
@@ -177,10 +175,7 @@ class ThumbWorker(threading.Thread):
     def _listing(self):
         stamp, names = self._names
         if time.monotonic() - stamp > 5:
-            try:
-                names = os.listdir(self.media_dir)
-            except OSError:
-                names = []
+            names = postmedia.list_names(self.media_dir)
             self._names = (time.monotonic(), names)
         return names
 

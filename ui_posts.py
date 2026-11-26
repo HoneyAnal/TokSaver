@@ -90,7 +90,7 @@ class PostsMixin:
                 pass
         win.after(150, _raise)
 
-        state = {"posts": [], "by_id": {}, "rows": [], "filter": tr('All'),
+        state = {"posts": [], "by_id": {}, "rows": [], "filter": tr('All'), "type": tr('All'),
                  "sort": self.settings.get("posts_sort", "new"), "sel_id": None,
                  "imgs": {}, "ready": 0, "warm": 0,
                  "view": "grid" if self.settings.get("posts_view") == "grid" else "list",
@@ -140,6 +140,21 @@ class PostsMixin:
         flow.add(ctk.CTkSegmentedButton(
             filt, values=[tr('All'), tr('Downloaded'), tr('Queue'), tr('Skipped')], variable=fvar,
             command=_on_filter, height=30, corner_radius=RADIUS, font=ctk.CTkFont(size=12),
+            fg_color=T["field"], selected_color=T["accent"],
+            selected_hover_color=T["accent_h"], unselected_color=T["field"],
+            unselected_hover_color=T["card_h"], text_color=T["text"]), gap=(0, 14))
+        tvar = ctk.StringVar(value=tr('All'))
+
+        def _on_type(_choice=None):
+            state["reset_scroll"] = True
+            state["type"] = tvar.get()
+            fill()
+
+        flow.add(ctk.CTkLabel(filt, text=tr('Type:'), font=ctk.CTkFont(size=12),
+                              text_color=T["muted"]), gap=(0, 0))
+        flow.add(ctk.CTkSegmentedButton(
+            filt, values=[tr('All'), tr('Photos'), tr('Videos')], variable=tvar,
+            command=_on_type, height=30, corner_radius=RADIUS, font=ctk.CTkFont(size=12),
             fg_color=T["field"], selected_color=T["accent"],
             selected_hover_color=T["accent_h"], unselected_color=T["field"],
             unselected_hover_color=T["card_h"], text_color=T["text"]), gap=(0, 14))
@@ -357,6 +372,10 @@ class PostsMixin:
             want = {tr('All'): None, tr('Downloaded'): 1, tr('Queue'): 0, tr('Skipped'): 2}.get(
                 state["filter"])
             shown = [p for p in state["posts"] if want is None or p["downloaded"] == want]
+            if state["type"] == tr('Photos'):
+                shown = [p for p in shown if postmedia.is_photo(p, state["media"])]
+            elif state["type"] == tr('Videos'):
+                shown = [p for p in shown if not postmedia.is_photo(p, state["media"])]
             shown = sorting.sort_posts(shown, state["sort"])
             state["rows"] = shown
             lb.delete(0, "end")

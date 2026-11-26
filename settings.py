@@ -33,6 +33,8 @@ DEFAULTS = {
     "language": "en",
     "log_open": True,
     "byedpi_port": 1080,
+    "byedpi_enabled": False,
+    "sort_by_type": True,
     "ytdlp_version": "latest",
     "ytdlp_auto_update": True,
     "parallel_downloads": 1,

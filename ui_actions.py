@@ -511,8 +511,17 @@ class ActionsMixin:
         self._append_log(LEVEL_INFO, tr('[System] Parallel downloads: {0}.', choice)
                          + (tr(' TikTok may limit frequent requests — the app will then pause by itself.') if int(choice) > 1 else ""))
 
+    def _toggle_sort(self):
+        self.engine.sort_by_type = bool(self.sort_var.get())
+        self.settings["sort_by_type"] = self.engine.sort_by_type
+        self._save_settings()
+        self._append_log(LEVEL_INFO, tr('[System] Sorting new files into Video/Photos folders: on.')
+                         if self.engine.sort_by_type else tr('[System] Sorting new files into folders: off.'))
+
     def _toggle_byedpi(self):
         self.engine.use_byedpi = bool(self.byedpi_var.get())
+        self.settings["byedpi_enabled"] = self.engine.use_byedpi
+        self._save_settings()
         if self.engine.use_byedpi:
             self.engine.start_byedpi()
             self._append_log(LEVEL_INFO, tr('[System] ByeDPI enabled.'))
@@ -551,6 +560,15 @@ class ActionsMixin:
 
     # ------------------------------ закрытие ------------------------------
     def on_close(self, restart=False):
+        if self._busy:
+            try:
+                if not messagebox.askyesno(
+                        tr('TokSaver'),
+                        tr('A download or sync is still running.\nClose anyway? Unfinished files will be resumed next time.'),
+                        icon="warning", default="no"):
+                    return
+            except Exception as _exc:
+                _LOG.debug('close confirm: %r', _exc)
         self._hide_calendar()
         self._close_posts_window()
         self._save_settings()

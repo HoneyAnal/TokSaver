@@ -96,6 +96,8 @@ class App(AutoSyncMixin, CalendarMixin, EditMixin, LogMixin, CardsMixin, PostsMi
         self._font_cache = {}        # шрифты-измерители для _btn_w (создаются один раз)
 
         self.engine = Engine(self._emit)
+        self.engine.use_byedpi = bool(self.settings.get("byedpi_enabled", False))
+        self.engine.sort_by_type = bool(self.settings.get("sort_by_type", True))
         self._load_cookie_prefs()           # источник cookies — с прошлого запуска
         try:
             self._font_family = tkfont.nametofont("TkDefaultFont").actual("family") or "Segoe UI"
@@ -563,12 +565,18 @@ class App(AutoSyncMixin, CalendarMixin, EditMixin, LogMixin, CardsMixin, PostsMi
 
         # --- настройки ---
         self._section(inner, tr('SETTINGS'))
-        self.byedpi_var = ctk.BooleanVar(value=True)
+        self.byedpi_var = ctk.BooleanVar(value=bool(self.engine.use_byedpi))
         self.byedpi_switch = ctk.CTkSwitch(
             inner, text=tr('Bypass blocking (ByeDPI)'), variable=self.byedpi_var,
             command=self._toggle_byedpi, progress_color=T["accent"], corner_radius=RADIUS,
             font=ctk.CTkFont(size=13), text_color=T["text"])
         self.byedpi_switch.pack(anchor="w")
+        self.sort_var = ctk.BooleanVar(value=bool(self.engine.sort_by_type))
+        self.sort_switch = ctk.CTkSwitch(
+            inner, text=tr('Sort files into Video / Photos folders'), variable=self.sort_var,
+            command=self._toggle_sort, progress_color=T["accent"], corner_radius=RADIUS,
+            font=ctk.CTkFont(size=13), text_color=T["text"])
+        self.sort_switch.pack(anchor="w", pady=(6, 0))
         self.proxy_status = ctk.CTkLabel(inner, text=tr('status: checking…'),
                                          font=ctk.CTkFont(size=11), text_color=T["muted"])
         self.proxy_status.pack(anchor="w", padx=(28, 0))
